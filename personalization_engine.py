@@ -1,19 +1,104 @@
 """
 MAUSAM — Personalization Engine
 Owner: Person 4
-Started: Sept 19 (skeleton). Real logic added Sept 20-27.
 
 This file takes (persona + weather data) and returns a personalized
 recommendation, following the contract in personalization_contract.md.
+
+Timeline of what was added when:
+Sept 19 - skeleton + dispatcher
+Sept 20 - Health persona logic
+Sept 21 - Fitness persona logic
+Sept 22 - Beach persona logic
+Sept 23 - Traveler persona logic
+Sept 24 - 9 universal occupation messages
+Sept 25 - Foreigner climate comparison
+Sept 26 - All messages centralized behind translation keys (see MESSAGE_TEMPLATES)
+Sept 27 - Official severe-weather warnings now override/boost persona output
+Sept 28 - Integration test matrix (persona x weather condition)
+Sept 29 - Edge-case hardening (missing/garbage input never crashes)
 """
 
 from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# STEP 1: The "dispatcher" — this is the ONLY function other teammates call.
-# It looks at which persona was requested and routes to the right function.
-# Everything else in this file is a private helper.
+# SEPT 26: Centralized message templates.
+# Every user-facing sentence lives HERE, keyed by a short id, instead of
+# being written directly inside each persona function. This is what
+# "routes through localization keys" means in practice: Person 6's
+# frontend translation files (en.json/ta.json/hi.json) will eventually
+# use these SAME keys to show Tamil/Hindi text instead of English -- the
+# persona logic below never needs to change when that happens.
+# ---------------------------------------------------------------------------
+
+MESSAGE_TEMPLATES = {
+    # Health
+    "health.aqi.hazardous": "Air quality is hazardous today — avoid outdoor activity if possible.",
+    "health.aqi.very_unhealthy": "Air quality is very unhealthy — people with asthma or allergies should stay indoors.",
+    "health.aqi.poor": "Air quality is poor — consider limiting prolonged outdoor exertion.",
+    "health.aqi.moderate": "Air quality is moderate — sensitive groups should take care outdoors.",
+    "health.uv.extreme": "UV index is extreme — avoid sun exposure between 10 AM and 4 PM.",
+    "health.uv.very_high": "UV index is very high — wear sunscreen and sunglasses outdoors.",
+    "health.uv.high": "UV index is high — sun protection is recommended.",
+    "health.humidity.high": "High humidity today — it may feel more uncomfortable than the temperature suggests.",
+    "health.pollen.high": "Pollen levels are high — allergy sufferers should take precautions.",
+    "health.pollen.moderate": "Pollen levels are moderate — mild allergy symptoms are possible.",
+    "health.all_clear": "Air quality, UV, humidity and pollen levels look fine today.",
+
+    # Fitness
+    "fitness.heat.extreme": "Very hot conditions — avoid outdoor exercise between 10 AM and 4 PM.",
+    "fitness.heat.warm": "Warm conditions — exercise earlier in the day if possible.",
+    "fitness.wind.strong": "Strong winds today — outdoor running conditions may be difficult.",
+    "fitness.rain.high_chance": "High chance of rain — consider an indoor workout today.",
+    "fitness.all_clear": "Good conditions for outdoor activity — best window is {best_hours}.",
+
+    # Beach
+    "beach.wave.unsafe": "Wave heights are unsafe for swimming today — avoid the water.",
+    "beach.wave.moderate": "Moderate waves today — swim with caution and stay near lifeguards.",
+    "beach.wind.strong": "Strong winds are affecting sea conditions — check local advisories.",
+    "beach.water.cool": "Water is on the cooler side today — a wetsuit is recommended.",
+    "beach.all_clear": "Sea conditions look good for a beach day.",
+
+    # Traveler
+    "traveler.warmer": "Your destination is considerably warmer than here.",
+    "traveler.cooler": "Your destination is considerably cooler than here.",
+    "traveler.similar": "Your destination's temperature is fairly similar to here.",
+    "traveler.rain_tip": "Carry a raincoat or umbrella — rain is expected at your destination.",
+    "traveler.missing_data": "Add your destination to see a packing suggestion.",
+
+    # Foreigner
+    "foreigner.warmer": "India today is considerably warmer than {country}.",
+    "foreigner.cooler": "India today is considerably cooler than {country}.",
+    "foreigner.similar": "India today is fairly similar in temperature to {country}.",
+    "foreigner.rain_tip": "Rain is likely — carry rain protection.",
+    "foreigner.unknown_country": "Select your home country to see a climate comparison.",
+
+    # Shared / official warnings (Sept 27)
+    "official_warning.prefix": "Official weather warning: {warning_message}",
+
+    # Fallback
+    "fallback.unknown_persona": "Personalized recommendations for this persona are coming soon.",
+    "fallback.error": "We couldn't generate a personalized update right now — showing general info instead.",
+}
+
+
+def _translate(key: str, language: str = "en", **params) -> str:
+    """
+    Looks up a message by its key instead of hardcoding English text
+    inline. Right now this only has English templates -- Person 6 extends
+    this on the frontend with i18next for Tamil/Hindi, using these exact
+    same keys. The persona logic never needs to change when that happens.
+    """
+    template = MESSAGE_TEMPLATES.get(key, "Information not available.")
+    try:
+        return template.format(**params)
+    except (KeyError, IndexError):
+        return template
+
+
+# ---------------------------------------------------------------------------
+# STEP 1: The dispatcher — the ONLY function other teammates call directly.
 # ---------------------------------------------------------------------------
 
 def personalize(persona: str, weather: dict, language: str = "en",
@@ -21,148 +106,119 @@ def personalize(persona: str, weather: dict, language: str = "en",
     """
     Main entry point. Person 1 (tech lead) calls this function from FastAPI.
 
-    Args:
-        persona: "health", "fitness", "beach", "traveler", "foreigner",
-                  or an occupation key like "fisherman" / "vendor" / etc.
-                  (see OCCUPATION_MESSAGES for the full occupation list)
-        weather: a dict matching the weather fields in the contract
-                  (temperature, humidity, uv_index, etc.) — some fields
-                  may be missing/None, always check before using them
-        language: "en" / "ta" / "hi" — not used yet, added Sept 26
-        home_country: only used when persona == "foreigner", e.g. "uk"
-
-    Returns:
-        A dict matching the OUTPUT contract: headline, message_key,
-        message, priority, cards.
+    Sept 29 hardening: this function NEVER raises an exception. If
+    anything inside goes wrong (bad persona, malformed weather data,
+    weather being None instead of a dict, etc.), it returns a safe
+    fallback response instead of crashing the whole API request.
     """
+    try:
+        # Defensive default: never let a missing/None weather object crash us.
+        if not isinstance(weather, dict):
+            weather = {}
 
-    # This dictionary maps the 4 CORE personas to their dedicated function.
-    # To add a new core persona later, add one line here.
-    persona_handlers = {
-        "health": _handle_health,
-        "fitness": _handle_fitness,
-        "beach": _handle_beach,
-        "traveler": _handle_traveler,
-    }
+        persona_handlers = {
+            "health": _handle_health,
+            "fitness": _handle_fitness,
+            "beach": _handle_beach,
+            "traveler": _handle_traveler,
+        }
 
-    handler = persona_handlers.get(persona)
-    if handler is not None:
-        return handler(weather)
+        handler = persona_handlers.get(persona)
 
-    # Foreigner comparison has its own function since it needs an extra
-    # argument (home_country) that the other personas don't use.
-    if persona == "foreigner":
-        return _handle_foreigner(weather, home_country)
+        if handler is not None:
+            output = handler(weather)
+        elif persona == "foreigner":
+            output = _handle_foreigner(weather, home_country)
+        elif persona in OCCUPATION_MESSAGES:
+            output = _handle_occupation(persona, weather)
+        else:
+            output = _fallback_response(persona)
 
-    # Any occupation name (fisherman, vendor, etc.) goes through the
-    # shared generic occupation handler.
-    if persona in OCCUPATION_MESSAGES:
-        return _handle_occupation(persona, weather)
+        # Sept 27: apply any official severe-weather warning on top of
+        # whatever the persona logic decided, regardless of which persona.
+        output = _apply_official_warning(output, weather)
 
-    # Unknown persona — never crash, always return something safe.
-    return _fallback_response(persona)
+        return output
+
+    except Exception:
+        # Sept 29: absolute last-resort safety net. Something unexpected
+        # went wrong above -- never let the API call fail because of it.
+        return _build_output(
+            persona=str(persona),
+            headline="MAUSAM",
+            message_key="fallback.error",
+            message=_translate("fallback.error"),
+            priority="low",
+            cards=[],
+        )
 
 
 # ---------------------------------------------------------------------------
-# STEP 2: One placeholder function per persona.
-# Today (Sept 19) these just return dummy-but-valid output so we can test
-# the pipeline end-to-end. Real logic replaces the "TODO" lines on their
-# scheduled day.
+# SEPT 20: Health persona
 # ---------------------------------------------------------------------------
 
 def _handle_health(weather: dict) -> dict:
-    """
-    Sept 20: Real logic for the Health persona.
-
-    Checks 4 things: AQI, UV index, humidity, pollen level.
-    Each check that finds a concern adds a (severity_rank, message) pair
-    to `warnings`. Rank 3 = most urgent, 1 = mild. At the end we pick the
-    SINGLE most urgent warning as the main headline/message, but every
-    value we checked still shows up as a small card regardless of severity.
-    """
-
     aqi = weather.get("aqi")
     uv_index = weather.get("uv_index")
     humidity = weather.get("humidity")
-    pollen_level = weather.get("pollen_level")  # expected: "low"/"moderate"/"high"
+    pollen_level = weather.get("pollen_level")
 
     cards = []
-    warnings = []  # list of (severity_rank, message_text)
+    warnings = []  # list of (severity_rank, message_key, params_dict)
 
-    # --- Check 1: Air Quality Index (AQI) ---
-    # Standard AQI bands: 0-50 Good, 51-100 Moderate, 101-150 Poor,
-    # 151-200 Very Unhealthy, 200+ Hazardous.
-    if aqi is not None:
+    if isinstance(aqi, (int, float)):
         cards.append({"type": "aqi", "value": aqi})
         if aqi > 200:
-            warnings.append((3, "Air quality is hazardous today — avoid outdoor activity if possible."))
+            warnings.append((3, "health.aqi.hazardous", {}))
         elif aqi > 150:
-            warnings.append((3, "Air quality is very unhealthy — people with asthma or allergies should stay indoors."))
+            warnings.append((3, "health.aqi.very_unhealthy", {}))
         elif aqi > 100:
-            warnings.append((2, "Air quality is poor — consider limiting prolonged outdoor exertion."))
+            warnings.append((2, "health.aqi.poor", {}))
         elif aqi > 50:
-            warnings.append((1, "Air quality is moderate — sensitive groups should take care outdoors."))
+            warnings.append((1, "health.aqi.moderate", {}))
 
-    # --- Check 2: UV Index ---
-    # 0-2 Low, 3-5 Moderate, 6-7 High, 8-10 Very High, 11+ Extreme.
-    if uv_index is not None:
+    if isinstance(uv_index, (int, float)):
         cards.append({"type": "uv", "value": uv_index})
         if uv_index >= 11:
-            warnings.append((3, "UV index is extreme — avoid sun exposure between 10 AM and 4 PM."))
+            warnings.append((3, "health.uv.extreme", {}))
         elif uv_index >= 8:
-            warnings.append((2, "UV index is very high — wear sunscreen and sunglasses outdoors."))
+            warnings.append((2, "health.uv.very_high", {}))
         elif uv_index >= 6:
-            warnings.append((1, "UV index is high — sun protection is recommended."))
+            warnings.append((1, "health.uv.high", {}))
 
-    # --- Check 3: Humidity ---
-    # High humidity makes conditions feel worse even if temperature is normal.
-    if humidity is not None:
+    if isinstance(humidity, (int, float)):
         cards.append({"type": "humidity", "value": humidity})
         if humidity >= 80:
-            warnings.append((1, "High humidity today — it may feel more uncomfortable than the temperature suggests."))
+            warnings.append((1, "health.humidity.high", {}))
 
-    # --- Check 4: Pollen level ---
     if pollen_level is not None:
         cards.append({"type": "pollen", "value": pollen_level})
         if pollen_level == "high":
-            warnings.append((2, "Pollen levels are high — allergy sufferers should take precautions."))
+            warnings.append((2, "health.pollen.high", {}))
         elif pollen_level == "moderate":
-            warnings.append((1, "Pollen levels are moderate — mild allergy symptoms are possible."))
+            warnings.append((1, "health.pollen.moderate", {}))
 
-    # --- Pick the single most urgent warning to be the headline message ---
     if warnings:
-        # Sort so the highest severity_rank comes first, then take that one.
         warnings.sort(key=lambda w: w[0], reverse=True)
-        top_rank, top_message = warnings[0]
-        priority_map = {3: "high", 2: "medium", 1: "low"}
-        priority = priority_map[top_rank]
-        message = top_message
+        top_rank, top_key, top_params = warnings[0]
+        priority = {3: "high", 2: "medium", 1: "low"}[top_rank]
+        message_key = top_key
+        message = _translate(top_key, **top_params)
         headline = "Health alert for today" if top_rank >= 2 else "Health check for today"
     else:
-        # Nothing concerning found (or no data available at all) — safe default.
         priority = "low"
-        message = "Air quality, UV, humidity and pollen levels look fine today."
+        message_key = "health.all_clear"
+        message = _translate(message_key)
         headline = "All clear today"
 
-    return _build_output(
-        persona="health",
-        headline=headline,
-        message_key="personalization.health.auto_generated",  # replaced with granular keys on Sept 26
-        message=message,
-        priority=priority,
-        cards=cards,
-    )
+    return _build_output("health", headline, message_key, message, priority, cards)
 
+
+# ---------------------------------------------------------------------------
+# SEPT 21: Fitness persona
+# ---------------------------------------------------------------------------
 
 def _handle_fitness(weather: dict) -> dict:
-    """
-    Sept 21: Real logic for the Fitness persona.
-
-    Checks: best running window (based on sunrise), temperature-based heat
-    warning, wind speed, and rain probability. Same "collect warnings, pick
-    the most urgent" pattern as Health.
-    """
-
     temperature = weather.get("temperature")
     wind_speed = weather.get("wind_speed")
     rain_probability = weather.get("rain_probability")
@@ -171,66 +227,47 @@ def _handle_fitness(weather: dict) -> dict:
     cards = []
     warnings = []
 
-    # --- Best running hours ---
-    # We don't have hour-by-hour forecast data yet, so we approximate:
-    # the 2 hours right after sunrise are usually coolest. If sunrise
-    # isn't available, fall back to a generic early-morning window.
-    if sunrise is not None:
-        best_hours = f"{sunrise} onward (next 2 hours are coolest)"
-    else:
-        best_hours = "6:00 AM – 8:00 AM"
+    best_hours = f"{sunrise} onward (next 2 hours are coolest)" if sunrise else "6:00 AM – 8:00 AM"
     cards.append({"type": "best_running_hours", "value": best_hours})
 
-    # --- Heat check ---
-    if temperature is not None:
+    if isinstance(temperature, (int, float)):
         cards.append({"type": "temperature", "value": temperature})
         if temperature > 35:
-            warnings.append((3, "Very hot conditions — avoid outdoor exercise between 10 AM and 4 PM."))
+            warnings.append((3, "fitness.heat.extreme", {}))
         elif temperature > 30:
-            warnings.append((2, "Warm conditions — exercise earlier in the day if possible."))
+            warnings.append((2, "fitness.heat.warm", {}))
 
-    # --- Wind check ---
-    if wind_speed is not None:
+    if isinstance(wind_speed, (int, float)):
         cards.append({"type": "wind", "value": wind_speed})
         if wind_speed > 30:
-            warnings.append((2, "Strong winds today — outdoor running conditions may be difficult."))
+            warnings.append((2, "fitness.wind.strong", {}))
 
-    # --- Rain check ---
-    if rain_probability is not None:
+    if isinstance(rain_probability, (int, float)):
         cards.append({"type": "rain_probability", "value": rain_probability})
         if rain_probability > 60:
-            warnings.append((2, "High chance of rain — consider an indoor workout today."))
+            warnings.append((2, "fitness.rain.high_chance", {}))
 
     if warnings:
         warnings.sort(key=lambda w: w[0], reverse=True)
-        top_rank, top_message = warnings[0]
-        priority_map = {3: "high", 2: "medium", 1: "low"}
-        priority = priority_map[top_rank]
-        message = top_message
+        top_rank, top_key, top_params = warnings[0]
+        priority = {3: "high", 2: "medium", 1: "low"}[top_rank]
+        message_key = top_key
+        message = _translate(top_key, **top_params)
         headline = "Heads up before your workout" if top_rank >= 2 else "Good day for a workout"
     else:
         priority = "low"
-        message = f"Good conditions for outdoor activity — best window is {best_hours}."
+        message_key = "fitness.all_clear"
+        message = _translate(message_key, best_hours=best_hours)
         headline = "Good day for a workout"
 
-    return _build_output(
-        persona="fitness",
-        headline=headline,
-        message_key="personalization.fitness.auto_generated",
-        message=message,
-        priority=priority,
-        cards=cards,
-    )
+    return _build_output("fitness", headline, message_key, message, priority, cards)
 
+
+# ---------------------------------------------------------------------------
+# SEPT 22: Beach persona
+# ---------------------------------------------------------------------------
 
 def _handle_beach(weather: dict) -> dict:
-    """
-    Sept 22: Real logic for the Beach/Surfer persona.
-
-    Checks: wave height (safety), wind speed (sea conditions), water
-    temperature (comfort), and tide (informational).
-    """
-
     tide = weather.get("tide")
     wave_height_m = weather.get("wave_height_m")
     water_temperature = weather.get("water_temperature")
@@ -239,123 +276,84 @@ def _handle_beach(weather: dict) -> dict:
     cards = []
     warnings = []
 
-    # --- Wave height check ---
-    if wave_height_m is not None:
+    if isinstance(wave_height_m, (int, float)):
         cards.append({"type": "wave_height", "value": wave_height_m})
         if wave_height_m > 2.5:
-            warnings.append((3, "Wave heights are unsafe for swimming today — avoid the water."))
+            warnings.append((3, "beach.wave.unsafe", {}))
         elif wave_height_m > 1.5:
-            warnings.append((2, "Moderate waves today — swim with caution and stay near lifeguards."))
+            warnings.append((2, "beach.wave.moderate", {}))
 
-    # --- Wind check (affects sea conditions) ---
-    if wind_speed is not None:
+    if isinstance(wind_speed, (int, float)):
         cards.append({"type": "wind", "value": wind_speed})
         if wind_speed > 25:
-            warnings.append((2, "Strong winds are affecting sea conditions — check local advisories."))
+            warnings.append((2, "beach.wind.strong", {}))
 
-    # --- Water temperature check ---
-    if water_temperature is not None:
+    if isinstance(water_temperature, (int, float)):
         cards.append({"type": "water_temperature", "value": water_temperature})
         if water_temperature < 20:
-            warnings.append((1, "Water is on the cooler side today — a wetsuit is recommended."))
+            warnings.append((1, "beach.water.cool", {}))
 
-    # --- Tide (informational, not a warning) ---
     if tide is not None:
         cards.append({"type": "tide", "value": tide})
 
     if warnings:
         warnings.sort(key=lambda w: w[0], reverse=True)
-        top_rank, top_message = warnings[0]
-        priority_map = {3: "high", 2: "medium", 1: "low"}
-        priority = priority_map[top_rank]
-        message = top_message
+        top_rank, top_key, top_params = warnings[0]
+        priority = {3: "high", 2: "medium", 1: "low"}[top_rank]
+        message_key = top_key
+        message = _translate(top_key, **top_params)
         headline = "Check before you go in" if top_rank >= 2 else "Beach conditions today"
     else:
         priority = "low"
-        message = "Sea conditions look good for a beach day."
+        message_key = "beach.all_clear"
+        message = _translate(message_key)
         headline = "Great beach day"
 
-    return _build_output(
-        persona="beach",
-        headline=headline,
-        message_key="personalization.beach.auto_generated",
-        message=message,
-        priority=priority,
-        cards=cards,
-    )
+    return _build_output("beach", headline, message_key, message, priority, cards)
 
+
+# ---------------------------------------------------------------------------
+# SEPT 23: Traveler persona
+# ---------------------------------------------------------------------------
 
 def _handle_traveler(weather: dict) -> dict:
-    """
-    Sept 23: Real logic for the Traveler persona.
-
-    Compares the user's current/home temperature against their
-    destination's temperature, and gives packing suggestions based on
-    the difference and destination rain conditions.
-    """
-
     home_temp = weather.get("temperature")
     destination_temp = weather.get("destination_temperature")
     destination_condition = weather.get("destination_condition") or ""
 
     cards = []
-
-    if home_temp is not None:
+    if isinstance(home_temp, (int, float)):
         cards.append({"type": "home_temperature", "value": home_temp})
-    if destination_temp is not None:
+    if isinstance(destination_temp, (int, float)):
         cards.append({"type": "destination_temperature", "value": destination_temp})
 
-    # If we don't have both temperatures, we can't compare -- give a safe generic message.
-    if home_temp is None or destination_temp is None:
-        return _build_output(
-            persona="traveler",
-            headline="Travel weather",
-            message_key="personalization.traveler.missing_data",
-            message="Add your destination to see a packing suggestion.",
-            priority="low",
-            cards=cards,
-        )
+    if not isinstance(home_temp, (int, float)) or not isinstance(destination_temp, (int, float)):
+        message_key = "traveler.missing_data"
+        return _build_output("traveler", "Travel weather", message_key,
+                              _translate(message_key), "low", cards)
 
     diff = destination_temp - home_temp
     cards.append({"type": "temperature_difference", "value": diff})
 
-    tips = []
     if diff >= 8:
-        message = "Your destination is considerably warmer than here."
-        tips.append("Pack light, breathable clothing.")
+        message_key = "traveler.warmer"
     elif diff <= -8:
-        message = "Your destination is considerably cooler than here."
-        tips.append("Pack a warm jacket or layers.")
+        message_key = "traveler.cooler"
     else:
-        message = "Your destination's temperature is fairly similar to here."
+        message_key = "traveler.similar"
 
+    message = _translate(message_key)
     priority = "medium" if abs(diff) >= 8 else "low"
 
-    # Rain check for the destination
     if "rain" in destination_condition.lower():
-        tips.append("Carry a raincoat or umbrella — rain is expected at your destination.")
+        cards.append({"type": "packing_tip", "value": _translate("traveler.rain_tip")})
         priority = "medium"
 
-    for tip in tips:
-        cards.append({"type": "packing_tip", "value": tip})
-
-    return _build_output(
-        persona="traveler",
-        headline="Before you pack",
-        message_key="personalization.traveler.auto_generated",
-        message=message,
-        priority=priority,
-        cards=cards,
-    )
+    return _build_output("traveler", "Before you pack", message_key, message, priority, cards)
 
 
 # ---------------------------------------------------------------------------
-# SEPT 24: Universal occupation messages.
-# Unlike the 4 core personas above (which each got their own function with
-# custom rules), occupations share ONE generic function. Each occupation
-# just needs 3 short messages (low/medium/high risk) in the dictionary
-# below -- adding a new occupation later means adding a few lines here,
-# not writing a whole new function.
+# SEPT 24: Universal occupation messages
 # ---------------------------------------------------------------------------
 
 OCCUPATION_MESSAGES = {
@@ -408,12 +406,12 @@ OCCUPATION_MESSAGES = {
 
 
 def _compute_generic_risk(weather: dict) -> str:
-    """A simple shared risk score reused by every occupation, based on
-    rain probability and wind speed. This is intentionally simple — it's
-    not meant to be as precise as the 4 core personas, just good enough
-    to pick which of the 3 pre-written messages to show."""
     rain_probability = weather.get("rain_probability") or 0
     wind_speed = weather.get("wind_speed") or 0
+    if not isinstance(rain_probability, (int, float)):
+        rain_probability = 0
+    if not isinstance(wind_speed, (int, float)):
+        wind_speed = 0
 
     if rain_probability >= 60 or wind_speed >= 30:
         return "high"
@@ -426,7 +424,6 @@ def _compute_generic_risk(weather: dict) -> str:
 def _handle_occupation(persona: str, weather: dict) -> dict:
     risk = _compute_generic_risk(weather)
     messages = OCCUPATION_MESSAGES.get(persona)
-
     if messages is None:
         return _fallback_response(persona)
 
@@ -435,21 +432,13 @@ def _handle_occupation(persona: str, weather: dict) -> dict:
         {"type": "rain_probability", "value": weather.get("rain_probability")},
         {"type": "wind", "value": weather.get("wind_speed")},
     ]
+    message_key = f"personalization.occupation.{persona}.{risk}"
 
-    return _build_output(
-        persona=persona,
-        headline=headline,
-        message_key=f"personalization.occupation.{persona}.{risk}",
-        message=messages[risk],
-        priority=risk,  # "low"/"medium"/"high" already match our priority values
-        cards=cards,
-    )
+    return _build_output(persona, headline, message_key, messages[risk], risk, cards)
 
 
 # ---------------------------------------------------------------------------
-# SEPT 25: Foreigner climate comparison.
-# Compares today's India temperature against the visitor's home country's
-# typical climate, and gives simple packing tips.
+# SEPT 25: Foreigner climate comparison
 # ---------------------------------------------------------------------------
 
 COUNTRY_CLIMATE_PROFILES = {
@@ -465,57 +454,71 @@ def _handle_foreigner(weather: dict, home_country: Optional[str]) -> dict:
     india_temp = weather.get("temperature")
     profile = COUNTRY_CLIMATE_PROFILES.get(home_country) if home_country else None
 
-    if profile is None or india_temp is None:
-        return _build_output(
-            persona="foreigner",
-            headline="Visiting India?",
-            message_key="personalization.foreigner.unknown_country",
-            message="Select your home country to see a climate comparison.",
-            priority="low",
-            cards=[],
-        )
+    if profile is None or not isinstance(india_temp, (int, float)):
+        message_key = "foreigner.unknown_country"
+        return _build_output("foreigner", "Visiting India?", message_key,
+                              _translate(message_key), "low", [])
 
     diff = india_temp - profile["avg_temperature"]
-    tips = []
+    cards = [{"type": "india_temperature", "value": india_temp}]
 
     if diff >= 8:
-        climate_note = f"India today is considerably warmer than {profile['name']}."
-        tips.append("Pack light, breathable clothing.")
-        tips.append("Carry a water bottle and stay hydrated.")
+        message_key = "foreigner.warmer"
     elif diff <= -8:
-        climate_note = f"India today is considerably cooler than {profile['name']}."
-        tips.append("Pack a light jacket or sweater.")
+        message_key = "foreigner.cooler"
     else:
-        climate_note = f"India today is fairly similar in temperature to {profile['name']}."
+        message_key = "foreigner.similar"
 
-    rain_probability = weather.get("rain_probability") or 0
-    if rain_probability >= 40:
-        tips.append("Rain is likely — carry rain protection.")
-
+    message = _translate(message_key, country=profile["name"])
     priority = "medium" if abs(diff) >= 8 else "low"
 
-    cards = [{"type": "india_temperature", "value": india_temp}]
-    for tip in tips:
-        cards.append({"type": "tip", "value": tip})
+    rain_probability = weather.get("rain_probability") or 0
+    if isinstance(rain_probability, (int, float)) and rain_probability >= 40:
+        cards.append({"type": "tip", "value": _translate("foreigner.rain_tip")})
+        priority = "medium"
 
-    return _build_output(
-        persona="foreigner",
-        headline=f"Visiting from {profile['name']}?",
-        message_key="personalization.foreigner.comparison",
-        message=climate_note,
-        priority=priority,
-        cards=cards,
-    )
+    headline = f"Visiting from {profile['name']}?"
+    return _build_output("foreigner", headline, message_key, message, priority, cards)
 
 
 # ---------------------------------------------------------------------------
-# STEP 3: Shared helpers — every persona function uses these so the OUTPUT
-# always matches the contract exactly, with no typos or missing fields.
+# SEPT 27: Official severe-weather warning override.
+# Person 3 (weather backend) / Person 5 (alerts) will attach an optional
+# "warning" object to the weather payload when IMD/district data flags a
+# real alert, shaped like:
+#   weather["warning"] = {"severity": "severe", "message": "Heavy rain warning issued"}
+# When present, we add it as a prominent card on TOP of whatever the
+# persona logic already decided, and raise priority if it's serious.
+# ---------------------------------------------------------------------------
+
+def _apply_official_warning(output: dict, weather: dict) -> dict:
+    warning = weather.get("warning")
+    if not isinstance(warning, dict):
+        return output  # nothing to do, most of the time
+
+    severity = str(warning.get("severity", "")).lower()
+    warning_message = warning.get("message", "")
+
+    if not warning_message:
+        return output
+
+    output["cards"].insert(0, {
+        "type": "official_warning",
+        "value": _translate("official_warning.prefix", warning_message=warning_message),
+    })
+
+    if severity in ("severe", "extreme", "high"):
+        output["priority"] = "high"
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _build_output(persona: str, headline: str, message_key: str,
                    message: str, priority: str, cards: list) -> dict:
-    """Guarantees every response has the exact shape the contract promises."""
     return {
         "persona": persona,
         "headline": headline,
@@ -527,83 +530,104 @@ def _build_output(persona: str, headline: str, message_key: str,
 
 
 def _fallback_response(persona: str) -> dict:
-    """Used when an unknown/unsupported persona is requested. Never crash."""
-    return _build_output(
-        persona=persona,
-        headline="Welcome to MAUSAM",
-        message_key="personalization.fallback.default",
-        message="Personalized recommendations for this persona are coming soon.",
-        priority="low",
-        cards=[],
-    )
+    message_key = "fallback.unknown_persona"
+    return _build_output(persona, "Welcome to MAUSAM", message_key,
+                          _translate(message_key), "low", [])
 
 
 # ---------------------------------------------------------------------------
-# STEP 4: A quick manual test you can run directly with `python personalization_engine.py`
-# This does NOT need FastAPI or the real weather backend — it's just to prove
-# the skeleton works before anyone else depends on it.
+# SEPT 28: INTEGRATION DAY — persona x weather-condition test matrix.
+# Not a new feature; this just runs every persona against several
+# realistic weather situations to catch anything broken before merging.
+# ---------------------------------------------------------------------------
+
+def _run_integration_matrix():
+    print("\n\n========== SEPT 28: INTEGRATION TEST MATRIX ==========")
+
+    weather_conditions = {
+        "calm": {"temperature": 26, "humidity": 55, "wind_speed": 8, "rain_probability": 10,
+                  "uv_index": 4, "aqi": 40, "pollen_level": "low",
+                  "tide": "low", "wave_height_m": 0.8, "water_temperature": 27,
+                  "destination_temperature": 24, "destination_condition": "Clear"},
+        "moderate": {"temperature": 32, "humidity": 70, "wind_speed": 20, "rain_probability": 40,
+                     "uv_index": 7, "aqi": 110, "pollen_level": "moderate",
+                     "tide": "rising", "wave_height_m": 1.8, "water_temperature": 24,
+                     "destination_temperature": 14, "destination_condition": "Cloudy"},
+        "severe": {"temperature": 38, "humidity": 90, "wind_speed": 35, "rain_probability": 80,
+                   "uv_index": 12, "aqi": 260, "pollen_level": "high",
+                   "tide": "high", "wave_height_m": 3.0, "water_temperature": 18,
+                   "destination_temperature": 5, "destination_condition": "Heavy Rain",
+                   "warning": {"severity": "severe", "message": "Heavy rain warning issued for your district"}},
+    }
+
+    core_personas = ["health", "fitness", "beach", "traveler"]
+    occupations = list(OCCUPATION_MESSAGES.keys())
+    all_personas = core_personas + occupations + ["foreigner", "not_a_real_persona"]
+
+    failures = []
+
+    for condition_name, weather in weather_conditions.items():
+        for persona in all_personas:
+            result = personalize(persona, weather, home_country="uk")
+            required_fields = {"persona", "headline", "message_key", "message", "priority", "cards"}
+            if not required_fields.issubset(result.keys()):
+                failures.append((condition_name, persona, "missing fields"))
+            if result["priority"] not in ("low", "medium", "high"):
+                failures.append((condition_name, persona, "bad priority value"))
+
+    print(f"Ran {len(weather_conditions) * len(all_personas)} persona x condition combinations.")
+    if failures:
+        print(f"FAILURES FOUND: {failures}")
+    else:
+        print("All combinations returned valid, correctly-shaped output. No failures.")
+
+
+# ---------------------------------------------------------------------------
+# SEPT 29: Edge-case / malformed-input testing.
+# ---------------------------------------------------------------------------
+
+def _run_edge_case_tests():
+    print("\n\n========== SEPT 29: EDGE CASE TESTS ==========")
+
+    edge_cases = [
+        ("weather is None", None),
+        ("weather is empty dict", {}),
+        ("weather is a string (malformed)", "not a real weather object"),
+        ("weather has wrong types", {"temperature": "very hot", "wind_speed": None}),
+        ("negative/extreme values", {"temperature": -50, "wind_speed": 999, "aqi": -10, "uv_index": 100}),
+    ]
+
+    for label, bad_weather in edge_cases:
+        print(f"\n--- Edge case: {label} ---")
+        try:
+            result = personalize("health", bad_weather)
+            print(f"OK — no crash. priority={result['priority']}, message={result['message']}")
+        except Exception as e:
+            print(f"FAILED — this should never happen: {e}")
+
+    # Also test a completely invalid persona
+    print("\n--- Edge case: completely invalid persona name ---")
+    result = personalize("xyz_not_real", {"temperature": 30})
+    print(f"OK — no crash. Returned fallback: {result}")
+
+
+# ---------------------------------------------------------------------------
+# Manual test runner
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    sample_weather = {
-        "temperature": 31,
-        "humidity": 76,
-        "wind_speed": 14,
-        "uv_index": 8,
-    }
-
-    print("=== Basic pipeline test (all personas, Sept 19 style) ===")
+    print("=== Basic pipeline test (core personas) ===")
+    sample_weather = {"temperature": 31, "humidity": 76, "wind_speed": 14, "uv_index": 8}
     for test_persona in ["health", "fitness", "beach", "traveler", "unknown_persona"]:
-        result = personalize(test_persona, sample_weather)
-        print(f"\n--- Testing persona: {test_persona} ---")
-        print(result)
+        print(f"\n--- {test_persona} ---")
+        print(personalize(test_persona, sample_weather))
 
-    print("\n\n=== Sept 20: Health persona scenario tests ===")
+    print("\n\n=== Sept 27: Official warning override test ===")
+    weather_with_warning = {
+        "temperature": 29, "humidity": 60, "wind_speed": 10,
+        "warning": {"severity": "severe", "message": "Heavy rain warning issued for your district"},
+    }
+    print(personalize("fitness", weather_with_warning))
 
-    # Scenario 1: everything looks fine -> expect "All clear today", priority low
-    mild_weather = {"aqi": 40, "uv_index": 3, "humidity": 55, "pollen_level": "low"}
-    print("\n--- Health scenario: mild (should be 'All clear') ---")
-    print(personalize("health", mild_weather))
-
-    # Scenario 2: moderate concerns -> expect priority medium
-    moderate_weather = {"aqi": 120, "uv_index": 7, "humidity": 65, "pollen_level": "moderate"}
-    print("\n--- Health scenario: moderate (should be priority medium) ---")
-    print(personalize("health", moderate_weather))
-
-    # Scenario 3: severe conditions -> expect priority high, hazardous AQI message wins
-    severe_weather = {"aqi": 250, "uv_index": 11, "humidity": 90, "pollen_level": "high"}
-    print("\n--- Health scenario: severe (should be priority high, AQI message) ---")
-    print(personalize("health", severe_weather))
-
-    # Scenario 4: missing data -> must not crash, should fall back to safe default
-    missing_weather = {}
-    print("\n--- Health scenario: missing data (should not crash) ---")
-    print(personalize("health", missing_weather))
-
-    print("\n\n=== Sept 21: Fitness persona test ===")
-    fitness_weather = {"temperature": 33, "wind_speed": 12, "rain_probability": 10, "sunrise": "06:02"}
-    print(personalize("fitness", fitness_weather))
-
-    print("\n\n=== Sept 22: Beach persona test ===")
-    beach_weather = {"tide": "low", "wave_height_m": 1.8, "water_temperature": 26, "wind_speed": 15}
-    print(personalize("beach", beach_weather))
-
-    print("\n\n=== Sept 23: Traveler persona test ===")
-    traveler_weather = {"temperature": 29, "destination_temperature": 12, "destination_condition": "Rainy"}
-    print(personalize("traveler", traveler_weather))
-
-    print("\n\n=== Sept 24: Universal occupation tests ===")
-    occupation_weather_calm = {"rain_probability": 10, "wind_speed": 8}
-    occupation_weather_risky = {"rain_probability": 70, "wind_speed": 35}
-    for occupation in ["fisherman", "vendor", "delivery_worker", "gardener",
-                        "student", "tourist", "sports_person", "it_professional", "homemaker"]:
-        print(f"\n--- {occupation} (calm weather) ---")
-        print(personalize(occupation, occupation_weather_calm))
-        print(f"--- {occupation} (risky weather) ---")
-        print(personalize(occupation, occupation_weather_risky))
-
-    print("\n\n=== Sept 25: Foreigner comparison tests ===")
-    india_weather = {"temperature": 33, "rain_probability": 50}
-    for country_code in ["uk", "canada", "japan", "unknown_country"]:
-        print(f"\n--- Visitor from: {country_code} ---")
-        print(personalize("foreigner", india_weather, home_country=country_code))
+    _run_integration_matrix()   # Sept 28
+    _run_edge_case_tests()      # Sept 29
