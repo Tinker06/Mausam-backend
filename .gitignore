@@ -33,3 +33,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+# Firebase service account secrets
+secrets/
+*serviceAccountKey*.json
