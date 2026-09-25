@@ -2,14 +2,19 @@
 import os
 
 import httpx
+
 from dotenv import load_dotenv
+
 from app.services.cache_service import get_cached, set_cached
+
 
 load_dotenv()
 
 API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
+
 async def get_weather(city: str):
+
     cache_key = f"weather_{city.lower()}"
 
     # Check cache first
@@ -27,7 +32,14 @@ async def get_weather(city: str):
     }
 
     async with httpx.AsyncClient() as client:
+
         response = await client.get(url, params=params)
+
+        if response.status_code == 404:
+            raise ValueError("City not found")
+
+        if response.status_code == 401:
+            raise ValueError("Invalid OpenWeather API key")
 
         response.raise_for_status()
 
@@ -47,7 +59,17 @@ async def get_weather(city: str):
 
         return weather_data
 
+
 async def get_forecast(city: str):
+
+    cache_key = f"forecast_{city.lower()}"
+
+    # Check cache first
+    cached_data = get_cached(cache_key)
+
+    if cached_data is not None:
+        return cached_data
+
     url = "https://api.openweathermap.org/data/2.5/forecast"
 
     params = {
@@ -57,6 +79,63 @@ async def get_forecast(city: str):
     }
 
     async with httpx.AsyncClient() as client:
+
+        response = await client.get(url, params=params)
+
+        if response.status_code == 404:
+            raise ValueError("City not found")
+
+        if response.status_code == 401:
+            raise ValueError("Invalid OpenWeather API key")
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        forecast = []
+
+        for item in data["list"]:
+
+            forecast.append({
+                "datetime": item["dt_txt"],
+                "temperature": item["main"]["temp"],
+                "feels_like": item["main"]["feels_like"],
+                "humidity": item["main"]["humidity"],
+                "condition": item["weather"][0]["description"],
+                "wind_speed": item["wind"]["speed"],
+                "rain_probability": item["pop"]
+            })
+
+        forecast_data = {
+            "city": data["city"]["name"],
+            "sunrise": data["city"]["sunrise"],
+            "sunset": data["city"]["sunset"],
+            "timezone": data["city"]["timezone"],
+            "forecast": forecast
+        }
+
+        # Save fresh forecast data in cache
+        set_cached(cache_key, forecast_data)
+
+        return forecast_data
+
+
+async def get_forecast_by_coordinates(
+    latitude: float,
+    longitude: float
+):
+
+    url = "https://api.openweathermap.org/data/2.5/forecast"
+
+    params = {
+        "lat": latitude,
+        "lon": longitude,
+        "appid": API_KEY,
+        "units": "metric"
+    }
+
+    async with httpx.AsyncClient() as client:
+
         response = await client.get(url, params=params)
 
         response.raise_for_status()
@@ -66,6 +145,7 @@ async def get_forecast(city: str):
         forecast = []
 
         for item in data["list"]:
+
             forecast.append({
                 "datetime": item["dt_txt"],
                 "temperature": item["main"]["temp"],
@@ -80,5 +160,7 @@ async def get_forecast(city: str):
             "city": data["city"]["name"],
             "sunrise": data["city"]["sunrise"],
             "sunset": data["city"]["sunset"],
+            "timezone": data["city"]["timezone"],
             "forecast": forecast
         }
+
