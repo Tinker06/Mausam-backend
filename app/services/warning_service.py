@@ -5,84 +5,123 @@ from app.services.weather_service import (
 )
 
 
-async def get_warning(city: str):
-    # Get current weather
-    weather = await get_weather(city)
+def analyze_warning(forecast):
 
-    # Get forecast data
-    forecast_data = await get_forecast(city)
+    high_rain = any(
+        item["rain_probability"] >= 0.70
+        for item in forecast
+    )
 
-    forecast = forecast_data["forecast"]
+    strong_wind = any(
+        item["wind_speed"] >= 15
+        for item in forecast
+    )
 
-    # Default values
-    severity = "NORMAL"
-    message = "No significant weather warning"
-    reason = "Current weather conditions are within normal range"
+    heavy_rain = any(
+        item["rain_probability"] >= 0.90
+        for item in forecast
+    )
 
-    # Check for possible weather risks
-    high_rain = any(item["rain_probability"] >= 0.70 for item in forecast)
-    strong_wind = any(item["wind_speed"] >= 15 for item in forecast)
+    extreme_heat = any(
+        item["temperature"] >= 38
+        for item in forecast
+    )
 
-    # Severity classification
-    if high_rain and strong_wind:
-        severity = "SEVERE"
-        message = "Severe weather conditions possible"
-        reason = "High rain probability and strong winds are expected"
+    # Highest severity condition
+    if heavy_rain and strong_wind:
 
-    elif high_rain:
-        severity = "MODERATE"
-        message = "Heavy rain may be possible"
-        reason = "High rain probability is expected"
+        return {
+            "severity": "SEVERE",
+            "message": "Heavy rain and strong winds may occur",
+            "reason": "Very high rain probability combined with strong winds",
+            "conditions": [
+                "Heavy rain",
+                "Strong winds"
+            ]
+        }
+
+    elif heavy_rain:
+
+        return {
+            "severity": "SEVERE",
+            "message": "Heavy rain may be possible",
+            "reason": "Very high rain probability is expected",
+            "conditions": [
+                "Heavy rain"
+            ]
+        }
 
     elif strong_wind:
-        severity = "MODERATE"
-        message = "Strong winds may be possible"
-        reason = "High wind speeds are expected"
+
+        return {
+            "severity": "MODERATE",
+            "message": "Strong winds may be possible",
+            "reason": "High wind speeds are expected",
+            "conditions": [
+                "Strong winds"
+            ]
+        }
+
+    elif high_rain:
+
+        return {
+            "severity": "MODERATE",
+            "message": "Rain may be possible",
+            "reason": "High rain probability is expected",
+            "conditions": [
+                "Rain"
+            ]
+        }
+
+    elif extreme_heat:
+
+        return {
+            "severity": "MODERATE",
+            "message": "High temperature conditions may occur",
+            "reason": "Temperature may reach 38°C or above",
+            "conditions": [
+                "High temperature"
+            ]
+        }
+
+    return {
+        "severity": "NORMAL",
+        "message": "No significant weather warning",
+        "reason": "Forecast conditions are within the prototype's warning thresholds",
+        "conditions": []
+    }
+
+
+async def get_warning(city: str):
+
+    weather = await get_weather(city)
+    forecast_data = await get_forecast(city)
+
+    warning = analyze_warning(
+        forecast_data["forecast"]
+    )
 
     return {
         "city": weather["city"],
-        "warning": {
-            "severity": severity,
-            "message": message,
-            "reason": reason
-        }
+        "warning": warning
     }
-async def get_warning_by_coordinates(latitude: float, longitude: float):
-    # Get forecast using coordinates
-    forecast_data = await get_forecast_by_coordinates(latitude, longitude)
 
-    forecast = forecast_data["forecast"]
 
-    # Default values
-    severity = "NORMAL"
-    message = "No significant weather warning"
-    reason = "Current weather conditions are within normal range"
+async def get_warning_by_coordinates(
+    latitude: float,
+    longitude: float
+):
 
-    # Check for possible weather risks
-    high_rain = any(item["rain_probability"] >= 0.70 for item in forecast)
-    strong_wind = any(item["wind_speed"] >= 15 for item in forecast)
+    forecast_data = await get_forecast_by_coordinates(
+        latitude,
+        longitude
+    )
 
-    # Severity classification
-    if high_rain and strong_wind:
-        severity = "SEVERE"
-        message = "Severe weather conditions possible"
-        reason = "High rain probability and strong winds are expected"
-
-    elif high_rain:
-        severity = "MODERATE"
-        message = "Heavy rain may be possible"
-        reason = "High rain probability is expected"
-
-    elif strong_wind:
-        severity = "MODERATE"
-        message = "Strong winds may be possible"
-        reason = "High wind speeds are expected"
+    warning = analyze_warning(
+        forecast_data["forecast"]
+    )
 
     return {
         "city": forecast_data["city"],
-        "warning": {
-            "severity": severity,
-            "message": message,
-            "reason": reason
-        }
+        "warning": warning
     }
